@@ -1,3 +1,7 @@
+# 0.5.2
+
+- Add `tcp_connect_lazy` to obtain local endpoint before connection completes
+
 # 0.5.1
 
 - Fix dead-lock in TcpStream::connect
