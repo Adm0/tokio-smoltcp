@@ -23,12 +23,11 @@ pub(crate) struct Reactor {
 
 async fn receive(
     async_iface: &mut impl crate::device::AsyncDevice,
-    recv_buf: &mut VecDeque<Packet>,
-) -> io::Result<()> {
-    if let Some(packet) = async_iface.next().await {
-        recv_buf.push_back(packet?);
+ ) -> io::Result<Option<Packet>> {
+    match async_iface.next().await {
+        Some(packet) => Ok(Some(packet?)),
+        None => Ok(None),
     }
-    Ok(())
 }
 
 async fn run(
@@ -49,6 +48,7 @@ async fn run(
     pin!(timer);
 
     loop {
+        let mut stream_ended = false;
         let packets = device.take_send_queue();
 
         async_iface
@@ -69,16 +69,24 @@ async fn run(
                 .reset(tokio::time::Instant::now() + deadline.into());
             select! {
                 _ = &mut timer => {},
-                _ = receive(&mut async_iface,&mut recv_buf) => {}
-                _ = notify.notified() => {}
+                packet = receive(&mut async_iface) => match packet? {
+                    Some(packet) => recv_buf.push_back(packet),
+                    None => break,
+                },
+                _ = notify.notified() => {},
                 _ = stopper.notified() => break,
             };
 
-            while let (true, Some(Ok(p))) = (
-                recv_buf.len() < max_burst_size,
-                async_iface.next().now_or_never().flatten(),
-            ) {
-                recv_buf.push_back(p);
+            while recv_buf.len() < max_burst_size {
+                match async_iface.next().now_or_never() {
+                    Some(Some(Ok(packet))) => recv_buf.push_back(packet),
+                    Some(Some(Err(err))) => return Err(err),
+                    Some(None) => {
+                        stream_ended = true;
+                        break;
+                    }
+                    None => break,
+                }
             }
         }
 
@@ -91,6 +99,10 @@ async fn run(
             &mut device,
             &mut socket_allocator.sockets().lock(),
         );
+
+        if stream_ended {
+            break;
+        }
     }
 
     Ok(())

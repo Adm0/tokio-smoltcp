@@ -2,7 +2,7 @@
 
 use std::{
     io,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicU16, Ordering},
@@ -16,7 +16,7 @@ pub use smoltcp;
 use smoltcp::{
     iface::{Config, Interface, Routes},
     time::{Duration, Instant},
-    wire::{HardwareAddress, IpAddress, IpCidr, IpProtocol, IpVersion},
+    wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, IpProtocol, IpVersion},
 };
 pub use socket::{RawSocket, TcpListener, TcpStream, UdpSocket};
 pub use socket_allocator::BufferSize;
@@ -129,11 +129,13 @@ impl Net {
             })
             .unwrap()
     }
+
     /// Creates a new TcpListener, which will be bound to the specified address.
     pub async fn tcp_bind(&self, addr: SocketAddr) -> io::Result<TcpListener> {
-        let addr = self.set_address(addr);
-        TcpListener::new(self.reactor.clone(), addr.into()).await
+        let (addr, endpoint) = self.bind_address(addr);
+        TcpListener::new(self.reactor.clone(), endpoint, addr).await
     }
+
     /// Opens a TCP connection to a remote host.
     pub async fn tcp_connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         TcpStream::connect(
@@ -156,8 +158,8 @@ impl Net {
     }
     /// This function will create a new UDP socket and attempt to bind it to the `addr` provided.
     pub async fn udp_bind(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
-        let addr = self.set_address(addr);
-        UdpSocket::new(self.reactor.clone(), addr.into()).await
+        let (addr, endpoint) = self.bind_address(addr);
+        UdpSocket::new(self.reactor.clone(), endpoint, addr).await
     }
     /// Creates a new raw socket.
     pub async fn raw_socket(
@@ -167,19 +169,18 @@ impl Net {
     ) -> io::Result<RawSocket> {
         RawSocket::new(self.reactor.clone(), ip_version, ip_protocol).await
     }
-    fn set_address(&self, mut addr: SocketAddr) -> SocketAddr {
-        if addr.ip().is_unspecified() {
-            addr.set_ip(match self.ip_addr.address() {
-                IpAddress::Ipv4(ip) => Ipv4Addr::from(ip).into(),
-                IpAddress::Ipv6(ip) => Ipv6Addr::from(ip).into(),
-                #[allow(unreachable_patterns)]
-                _ => panic!("address must not be unspecified"),
-            });
-        }
+    fn bind_address(&self, mut addr: SocketAddr) -> (SocketAddr, IpListenEndpoint) {
         if addr.port() == 0 {
             addr.set_port(self.get_port());
         }
-        addr
+
+        let endpoint = if addr.ip().is_unspecified() {
+            addr.port().into()
+        } else {
+            addr.into()
+        };
+
+        (addr, endpoint)
     }
 
     /// Enable or disable the AnyIP capability.
@@ -215,5 +216,235 @@ impl Net {
 impl Drop for Net {
     fn drop(&mut self) {
         self.stopper.notify_waiters()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{Sink, SinkExt, Stream};
+    use smoltcp::{
+        phy::{DeviceCapabilities, Medium},
+        socket::Socket,
+    };
+    use std::{
+        io,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration as StdDuration,
+    };
+
+    #[derive(Clone)]
+    struct PendingDevice {
+        caps: DeviceCapabilities,
+    }
+
+    impl Stream for PendingDevice {
+        type Item = io::Result<device::Packet>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Sink<device::Packet> for PendingDevice {
+        type Error = io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: device::Packet) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl device::AsyncDevice for PendingDevice {
+        fn capabilities(&self) -> &DeviceCapabilities {
+            &self.caps
+        }
+    }
+
+    struct EofDevice {
+        caps: DeviceCapabilities,
+    }
+
+    impl Stream for EofDevice {
+        type Item = io::Result<device::Packet>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(None)
+        }
+    }
+
+    impl Sink<device::Packet> for EofDevice {
+        type Error = io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: device::Packet) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl device::AsyncDevice for EofDevice {
+        fn capabilities(&self) -> &DeviceCapabilities {
+            &self.caps
+        }
+    }
+
+    fn ip_caps() -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ip;
+        caps.max_transmission_unit = 1500;
+        caps.max_burst_size = Some(1);
+        caps
+    }
+
+    fn test_config() -> NetConfig {
+        let mut interface_config = Config::new(HardwareAddress::Ip);
+        interface_config.random_seed = 1;
+        NetConfig::new(
+            interface_config,
+            IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24),
+            vec![],
+        )
+    }
+
+    #[tokio::test]
+    async fn tcp_bind_keeps_unspecified_addr_for_wildcard_bind() {
+        let (net, _fut) = Net::new2(PendingDevice { caps: ip_caps() }, test_config());
+
+        let listener = net.tcp_bind("0.0.0.0:12345".parse().unwrap()).await.unwrap();
+
+        assert!(
+            listener.local_addr().unwrap().ip().is_unspecified(),
+            "wildcard tcp bind should preserve an unspecified local address",
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_bind_keeps_unspecified_addr_for_wildcard_bind() {
+        let (net, _fut) = Net::new2(PendingDevice { caps: ip_caps() }, test_config());
+
+        let socket = net.udp_bind("0.0.0.0:12345".parse().unwrap()).await.unwrap();
+
+        assert!(
+            socket.local_addr().unwrap().ip().is_unspecified(),
+            "wildcard udp bind should preserve an unspecified local address",
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_returns_error_when_socket_closes_during_handshake() {
+        let (net, _fut) = Net::new2(PendingDevice { caps: ip_caps() }, test_config());
+        let mut connect = Box::pin(net.tcp_connect("10.0.0.2:80".parse().unwrap()));
+
+        assert!(matches!(futures::poll!(&mut connect), Poll::Pending));
+
+        {
+            let mut sockets = net.reactor.socket_allocator().sockets().lock();
+            let mut closed = false;
+            for (_, socket) in sockets.iter_mut() {
+                if let Socket::Tcp(tcp) = socket {
+                    tcp.close();
+                    closed = true;
+                    break;
+                }
+            }
+            assert!(closed, "test setup should create exactly one tcp socket");
+        }
+
+        let result = tokio::time::timeout(StdDuration::from_millis(50), &mut connect).await;
+        let connect_result = result.expect("connect future should resolve after the socket closes");
+        assert!(
+            connect_result.is_err(),
+            "connect should fail once the in-flight socket is closed",
+        );
+    }
+
+    #[tokio::test]
+    async fn reactor_stops_when_device_stream_ends() {
+        let (_net, fut) = Net::new2(EofDevice { caps: ip_caps() }, test_config());
+
+        let result = tokio::time::timeout(StdDuration::from_millis(50), fut).await;
+
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "reactor should terminate cleanly when the device stream ends, got {result:?}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_capture_retries_buffered_packet_on_flush() {
+        use crate::device::AsyncCapture;
+        use std::os::unix::net::UnixStream;
+
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let send_attempts = attempts.clone();
+        let mut capture = AsyncCapture::new(
+            stream,
+            |_obj| Err(io::ErrorKind::WouldBlock.into()),
+            move |_obj, _pkt| {
+                let attempt = send_attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(io::ErrorKind::WouldBlock.into())
+                } else {
+                    Ok(())
+                }
+            },
+            ip_caps(),
+        )
+        .unwrap();
+
+        capture.send(vec![1, 2, 3]).await.unwrap();
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "flush should retry the buffered packet after the initial WouldBlock",
+        );
     }
 }

@@ -44,7 +44,10 @@ where
     ///
     /// The `caps` is used to determine the device capabilities. `DeviceCapabilities::max_transmission_unit` must be set.
     pub fn new(obj: T, recv: R, send: S, caps: DeviceCapabilities) -> io::Result<Self> {
-        let async_fd = AsyncFd::with_interest(obj.as_raw_fd(), Interest::READABLE)?;
+        let async_fd = AsyncFd::with_interest(
+            obj.as_raw_fd(),
+            Interest::READABLE | Interest::WRITABLE,
+        )?;
         Ok(AsyncCapture {
             obj,
             recv,
@@ -108,34 +111,41 @@ where
 
         match send(obj, &item) {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                *this.poll_write = true;
                 *this.temp = Some(item);
                 Ok(())
             }
-            r => r,
+            r => {
+                *this.poll_write = false;
+                r
+            }
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if !self.poll_write {
-            // drop packet
+        let mut this = self.project();
+
+        if !*this.poll_write {
             return Poll::Ready(Ok(()));
         }
-        let mut this = self.project();
+
         if let Some(p) = &this.temp {
             let obj = &mut this.obj;
             let send = this.send;
 
             loop {
                 let mut guard = ready!(this.async_fd.poll_write_ready(cx))?;
-                match guard.try_io(|_| send(obj, &p)) {
+                match guard.try_io(|_| send(obj, p)) {
                     Ok(result) => {
                         this.temp.take();
+                        *this.poll_write = false;
                         return Poll::Ready(result);
                     }
                     Err(_) => continue,
                 }
             }
         } else {
+            *this.poll_write = false;
             Poll::Ready(Ok(()))
         }
     }

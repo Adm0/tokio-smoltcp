@@ -2,7 +2,7 @@ use super::{reactor::Reactor, socket_allocator::SocketHandle};
 use futures::future::{self, poll_fn};
 use futures::{Stream, ready};
 pub use smoltcp::socket::{raw, tcp, udp};
-use smoltcp::wire::{IpAddress, IpEndpoint, IpProtocol, IpVersion};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion};
 use std::mem::replace;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::{
@@ -30,7 +30,8 @@ fn map_err<E: std::error::Error>(e: E) -> io::Error {
 impl TcpListener {
     pub(super) async fn new(
         reactor: Arc<Reactor>,
-        local_endpoint: IpEndpoint,
+        local_endpoint: IpListenEndpoint,
+        local_addr: SocketAddr,
     ) -> io::Result<TcpListener> {
         let handle = reactor.socket_allocator().new_tcp_socket();
         {
@@ -38,7 +39,6 @@ impl TcpListener {
             socket.listen(local_endpoint).map_err(map_err)?;
         }
 
-        let local_addr = ep2sa(&local_endpoint);
         Ok(TcpListener {
             handle,
             reactor,
@@ -170,6 +170,12 @@ impl TcpStream {
         if socket.state() == tcp::State::Established {
             return Poll::Ready(Ok(()));
         }
+        if socket.state() == tcp::State::Closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "tcp connect failed",
+            )));
+        }
         socket.register_send_waker(cx.waker());
         Poll::Pending
     }
@@ -250,15 +256,14 @@ pub struct UdpSocket {
 impl UdpSocket {
     pub(super) async fn new(
         reactor: Arc<Reactor>,
-        local_endpoint: IpEndpoint,
+        local_endpoint: IpListenEndpoint,
+        local_addr: SocketAddr,
     ) -> io::Result<UdpSocket> {
         let handle = reactor.socket_allocator().new_udp_socket();
         {
             let mut socket = reactor.get_socket::<udp::Socket>(*handle);
             socket.bind(local_endpoint).map_err(map_err)?;
         }
-
-        let local_addr = ep2sa(&local_endpoint);
 
         Ok(UdpSocket {
             handle,
