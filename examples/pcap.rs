@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use dns_parser::QueryType;
-use pcap::{Capture, Device};
+use pcap::Device;
 use smoltcp::{
     phy::DeviceCapabilities,
     wire::{EthernetAddress, IpAddress, IpCidr},
@@ -22,8 +22,30 @@ struct Opt {
 
 #[cfg(unix)]
 fn get_by_device(device: Device) -> Result<impl AsyncDevice> {
-    use std::io;
+    use std::{
+        ffi::c_void,
+        io,
+        os::unix::io::{AsRawFd, RawFd},
+    };
+    use pcap::{Active, Capture};
+    use tokio::io::Interest;
     use tokio_smoltcp::device::AsyncCapture;
+
+    #[link(name = "pcap")]
+    unsafe extern "C" {
+        fn pcap_get_selectable_fd(handle: *mut c_void) -> i32;
+    }
+
+    struct SelectableCapture {
+        cap: Capture<Active>,
+        fd: RawFd,
+    }
+
+    impl AsRawFd for SelectableCapture {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd
+        }
+    }
 
     let cap = Capture::from_device(device.clone())
         .context("Failed to capture device")?
@@ -40,25 +62,34 @@ fn get_by_device(device: Device) -> Result<impl AsyncDevice> {
             other => io::Error::new(io::ErrorKind::Other, other),
         }
     }
+
+    let cap = cap.setnonblock().context("Failed to set nonblock")?;
+    let fd = unsafe { pcap_get_selectable_fd(cap.as_ptr().cast::<c_void>()) };
+    if fd < 0 {
+        return Err(anyhow!("pcap device does not expose a selectable fd"));
+    }
+    let cap = SelectableCapture { cap, fd };
+
     let mut caps = DeviceCapabilities::default();
     caps.max_burst_size = Some(100);
     caps.max_transmission_unit = 1500;
 
-    Ok(AsyncCapture::new(
-        cap.setnonblock().context("Failed to set nonblock")?,
+    Ok(AsyncCapture::new_with_interest(
+        cap,
         |d| {
-            let r = d.next_packet().map_err(map_err).map(|p| p.to_vec());
+            let r = d.cap.next_packet().map_err(map_err).map(|p| p.to_vec());
             // eprintln!("recv {:?}", r);
             r
         },
         |d, pkt| {
-            let r = d.sendpacket(pkt).map_err(map_err);
+            let r = d.cap.sendpacket(pkt).map_err(map_err);
             // eprintln!("send {:?}", r);
             r
         },
         caps,
+        Interest::READABLE,
     )
-    .context("Failed to create async capture")?)
+    .context("Failed to create async capture with selectable fd")?)
 }
 
 #[cfg(windows)]

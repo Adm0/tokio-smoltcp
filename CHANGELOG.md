@@ -1,3 +1,9 @@
+# 0.6.0
+
+- Upgrade `smoltcp` to `0.13`
+- Add `AsyncCapture::new_with_interest` so callers can use selectable read-only fds
+- Fix the `pcap` example on macOS by using `pcap_get_selectable_fd()`
+
 # 0.5.2
 
 - Add `tcp_connect_lazy` to obtain local endpoint before connection completes

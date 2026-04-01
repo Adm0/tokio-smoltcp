@@ -44,9 +44,20 @@ where
     ///
     /// The `caps` is used to determine the device capabilities. `DeviceCapabilities::max_transmission_unit` must be set.
     pub fn new(obj: T, recv: R, send: S, caps: DeviceCapabilities) -> io::Result<Self> {
+        Self::new_with_interest(obj, recv, send, caps, Interest::READABLE | Interest::WRITABLE)
+    }
+
+    /// Make a new `AsyncCapture` with an explicit readiness interest.
+    pub fn new_with_interest(
+        obj: T,
+        recv: R,
+        send: S,
+        caps: DeviceCapabilities,
+        interest: Interest,
+    ) -> io::Result<Self> {
         let async_fd = AsyncFd::with_interest(
             obj.as_raw_fd(),
-            Interest::READABLE | Interest::WRITABLE,
+            interest,
         )?;
         Ok(AsyncCapture {
             obj,

@@ -1,6 +1,6 @@
 [package]
 name = "tokio-smoltcp"
-version = "0.5.2"
+version = "0.6.0"
 authors = ["spacemeowx2 <spacemeowx2@gmail.com>"]
 edition = "2024"
 description = "An asynchronous wrapper for smoltcp."
@@ -19,7 +19,7 @@ tokio-util = "0.7"
 parking_lot = "0.12"
 
 [dependencies.smoltcp]
-version = "0.12"
+version = "0.13"
 default-features = false
 features = [
     "std",

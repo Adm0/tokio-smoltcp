@@ -108,7 +108,7 @@ impl SocketAlloctor {
             vec![raw::PacketMetadata::EMPTY; self.buffer_size.raw_tx_meta_size],
             vec![0; self.buffer_size.raw_tx_size],
         );
-        let raw = raw::Socket::new(ip_version, ip_protocol, rx_buffer, tx_buffer);
+        let raw = raw::Socket::new(Some(ip_version), Some(ip_protocol), rx_buffer, tx_buffer);
 
         raw
     }
