@@ -45,16 +45,18 @@ pub struct Neighbor {
 #[non_exhaustive]
 pub struct NetConfig {
     pub interface_config: Config,
-    pub ip_addr: IpCidr,
+    pub ip4_addr: Option<IpCidr>,
+    pub ip6_addr: Option<IpCidr>,
     pub gateway: Vec<IpAddress>,
     pub buffer_size: BufferSize,
 }
 
 impl NetConfig {
-    pub fn new(interface_config: Config, ip_addr: IpCidr, gateway: Vec<IpAddress>) -> Self {
+    pub fn new(interface_config: Config, ip4_addr: Option<IpCidr>, ip6_addr: Option<IpCidr>, gateway: Vec<IpAddress>) -> Self {
         Self {
             interface_config,
-            ip_addr,
+            ip4_addr,
+            ip6_addr,
             gateway,
             buffer_size: Default::default(),
         }
@@ -67,7 +69,8 @@ impl NetConfig {
 /// When `Net` is dropped, all sockets are closed and the network stack is stopped.
 pub struct Net {
     reactor: Arc<Reactor>,
-    ip_addr: IpCidr,
+    ip4_addr: Option<IpCidr>,
+    ip6_addr: Option<IpCidr>,
     from_port: AtomicU16,
     stopper: Arc<Notify>,
 }
@@ -86,9 +89,15 @@ impl Net {
     ) -> (Net, impl Future<Output = io::Result<()>> + Send) {
         let mut buffer_device = BufferDevice::new(device.capabilities().clone());
         let mut iface = Interface::new(config.interface_config, &mut buffer_device, Instant::now());
-        let ip_addr = config.ip_addr;
+        let ip4_addr = config.ip4_addr;
+        let ip6_addr = config.ip6_addr;
         iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs.push(ip_addr).unwrap();
+            if ip4_addr.is_some() {
+                ip_addrs.push(ip4_addr.unwrap()).unwrap();
+            }
+            if ip6_addr.is_some() {
+                ip_addrs.push(ip6_addr.unwrap()).unwrap();
+            }
         });
         for gateway in config.gateway {
             match gateway {
@@ -115,7 +124,8 @@ impl Net {
         (
             Net {
                 reactor: Arc::new(reactor),
-                ip_addr: config.ip_addr,
+                ip4_addr: config.ip4_addr,
+                ip6_addr: config.ip6_addr,
                 from_port: AtomicU16::new(10001),
                 stopper,
             },
@@ -138,9 +148,18 @@ impl Net {
 
     /// Opens a TCP connection to a remote host.
     pub async fn tcp_connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
+        let local_addr = if addr.is_ipv6() {
+            self.ip6_addr
+                .map(|a| { a.address() })
+                .unwrap_or(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0))
+        } else {
+            self.ip4_addr
+                .map(|a| { a.address() })
+                .unwrap_or(IpAddress::v4(0, 0, 0, 0))
+        };
         TcpStream::connect(
             self.reactor.clone(),
-            (self.ip_addr.address(), self.get_port()).into(),
+            (local_addr, self.get_port()).into(),
             addr.into(),
         )
         .await
@@ -152,7 +171,16 @@ impl Net {
         SocketAddr,
         impl Future<Output = Result<TcpStream, std::io::Error>>,
     ) {
-        let local_endpoint: SocketAddr = (self.ip_addr.address(), self.get_port()).into();
+        let local_addr = if addr.is_ipv6() {
+            self.ip6_addr
+                .map(|a| { a.address() })
+                .unwrap_or(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0))
+        } else {
+            self.ip4_addr
+                .map(|a| { a.address() })
+                .unwrap_or(IpAddress::v4(0, 0, 0, 0))
+        };
+        let local_endpoint: SocketAddr = (local_addr, self.get_port()).into();
         let future = TcpStream::connect(self.reactor.clone(), local_endpoint.into(), addr.into());
         (local_endpoint, future)
     }
@@ -346,7 +374,8 @@ mod tests {
         interface_config.random_seed = 1;
         NetConfig::new(
             interface_config,
-            IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24),
+            Some(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24)),
+            Some(IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0,0,0,1), 64)),
             vec![],
         )
     }
